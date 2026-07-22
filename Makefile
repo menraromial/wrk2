@@ -49,9 +49,16 @@ $(OBJ): config.h Makefile $(LDIR)/libluajit.a | $(ODIR)
 $(ODIR):
 	@mkdir -p $@
 
-$(ODIR)/bytecode.o: src/wrk.lua
+# Emit the bytecode as C rather than as an object file: LuaJIT's own ELF
+# writer produces a string table that recent binutils rejects, which links
+# but leaves the wrk module unloadable at runtime.
+$(ODIR)/bytecode.c: src/wrk.lua $(LDIR)/libluajit.a | $(ODIR)
 	@echo LUAJIT $<
 	@$(SHELL) -c 'cd $(LDIR) && ./luajit -b $(CURDIR)/$< $(CURDIR)/$@'
+
+$(ODIR)/bytecode.o: $(ODIR)/bytecode.c
+	@echo CC $<
+	@$(CC) $(CFLAGS) -c -o $@ $<
 
 $(ODIR)/%.o : %.c
 	@echo CC $<

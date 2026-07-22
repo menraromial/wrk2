@@ -20,10 +20,24 @@
 #define VERSION  "4.0.0"
 #define RECVBUF  8192
 #define SAMPLES  100000000
+#define CSV_BUFSIZE (1 << 20)
 
 #define SOCKET_TIMEOUT_MS   2000
 #define CALIBRATE_DELAY_MS  10000
 #define TIMEOUT_INTERVAL_MS 2000
+
+// A single per-response record, kept in memory during the run and written
+// out to the CSV file once every thread has finished. Latencies are not
+// stored: they are derived from the timestamps when the file is written.
+typedef struct {
+    uint64_t timestamp;      // response completion time (usec since epoch)
+    uint64_t expected_start; // time the request was due to be sent
+    uint64_t send_start;     // time the request was actually written out
+    uint32_t connection;     // connection index within the thread
+    uint32_t seq;            // response number on that connection
+    uint16_t status;         // HTTP status code
+    uint8_t  calibrated;     // 0 while the thread was still calibrating
+} sample;
 
 typedef struct {
     pthread_t thread;
@@ -44,6 +58,12 @@ typedef struct {
     lua_State *L;
     errors errors;
     struct connection *cs;
+    bool calibrated;
+    sample *samples;
+    uint64_t samples_len;
+    uint64_t samples_cap;
+    uint64_t samples_seen;
+    uint64_t samples_pick;
 } thread;
 
 typedef struct {

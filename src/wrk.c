@@ -23,8 +23,12 @@ static struct config {
     bool     record_all_responses;
     char    *host;
     char    *script;
+    char    *csv;
+    uint64_t csv_sample;
     SSL_CTX *ctx;
 } cfg;
+
+static uint64_t test_start_us;
 
 static struct {
     stats *requests;
@@ -68,6 +72,10 @@ static void usage() {
            "    -R, --rate        <T>  work rate (throughput)     \n"
            "                           in requests/sec (total)    \n"
            "                           [Required Parameter]       \n"
+           "    -o, --csv         <F>  Write a per-request CSV    \n"
+           "                           trace to file F            \n"
+           "    -n, --csv-sample  <N>  Keep only 1 response in N  \n"
+           "                           in the CSV trace           \n"
            "                                                      \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
@@ -102,7 +110,17 @@ int main(int argc, char **argv) {
     }
 	
     cfg.host = host;
-	
+
+    // Fail before the run rather than after it if the trace is unwritable.
+    if (cfg.csv) {
+        FILE *f = fopen(cfg.csv, "w");
+        if (!f) {
+            fprintf(stderr, "unable to write %s: %s\n", cfg.csv, strerror(errno));
+            exit(1);
+        }
+        fclose(f);
+    }
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  SIG_IGN);
 
@@ -122,7 +140,8 @@ int main(int argc, char **argv) {
     
     uint64_t connections = cfg.connections / cfg.threads;
     double throughput    = (double)cfg.rate / cfg.threads;
-    uint64_t stop_at     = time_us() + (cfg.duration * 1000000);
+    test_start_us        = time_us();
+    uint64_t stop_at     = test_start_us + (cfg.duration * 1000000);
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
@@ -162,6 +181,17 @@ int main(int argc, char **argv) {
     printf("Running %s test @ %s\n", time, url);
     printf("  %"PRIu64" threads and %"PRIu64" connections\n",
             cfg.threads, cfg.connections);
+
+    if (cfg.csv) {
+        uint64_t buffered = csv_samples_per_thread(throughput) * cfg.threads;
+        char *mem = format_binary(buffered * sizeof(sample));
+        printf("  Recording a per-request trace to %s (%sB buffered", cfg.csv, mem);
+        if (cfg.csv_sample > 1) {
+            printf(", 1 response in %"PRIu64, cfg.csv_sample);
+        }
+        printf(")\n");
+        free(mem);
+    }
 
     uint64_t start    = time_us();
     uint64_t complete = 0;
@@ -238,6 +268,23 @@ int main(int argc, char **argv) {
     printf("Requests/sec: %9.2Lf\n", req_per_s);
     printf("Transfer/sec: %10sB\n", format_binary(bytes_per_s));
 
+    if (cfg.csv) {
+        int64_t rows = write_csv(cfg.csv, threads, cfg.threads);
+        if (rows >= 0) {
+            printf("Per-request trace: %"PRId64" rows written to %s\n",
+                    rows, cfg.csv);
+        }
+
+        // Hand the trace buffers back before the Lua done() hook runs: they
+        // are the largest allocation of the run and nothing needs them now.
+        for (uint64_t i = 0; i < cfg.threads; i++) {
+            zfree(threads[i].samples);
+            threads[i].samples     = NULL;
+            threads[i].samples_len = 0;
+            threads[i].samples_cap = 0;
+        }
+    }
+
     if (script_has_done(L)) {
         script_summary(L, runtime_us, complete, bytes);
         script_errors(L, &errors);
@@ -255,6 +302,14 @@ void *thread_main(void *arg) {
     tinymt64_init(&thread->rand, time_us());
     hdr_init(1, MAX_LATENCY, 3, &thread->latency_histogram);
     hdr_init(1, MAX_LATENCY, 3, &thread->u_latency_histogram);
+
+    if (cfg.csv) {
+        // Size the trace buffer up front for the responses this thread is
+        // expected to keep, so that no allocation happens on the hot path.
+        thread->samples_cap  = csv_samples_per_thread(thread->throughput);
+        thread->samples      = zmalloc(thread->samples_cap * sizeof(sample));
+        thread->samples_pick = csv_pick_in_window(thread);
+    }
 
     char *request = NULL;
     size_t length = 0;
@@ -352,6 +407,7 @@ static int calibrate(aeEventLoop *loop, long long id, void *data) {
     if (mean == 0) return CALIBRATE_DELAY_MS;
 
     thread->mean     = (uint64_t) mean;
+    thread->calibrated = true;
     hdr_reset(thread->latency_histogram);
     hdr_reset(thread->u_latency_histogram);
 
@@ -402,6 +458,53 @@ static int sample_rate(aeEventLoop *loop, long long id, void *data) {
     thread->start    = time_us();
 
     return thread->interval;
+}
+
+static uint64_t csv_samples_per_thread(double throughput) {
+    // Enough room for the responses a thread is expected to keep, plus 25%
+    // of headroom. The buffer still grows on demand beyond that.
+    double expected = throughput * cfg.duration * 1.25;
+    return (uint64_t) (expected / cfg.csv_sample) + 1024;
+}
+
+// Keep exactly one response per window of cfg.csv_sample responses, at a
+// position drawn afresh for each window. Always keeping the same position
+// would lock onto the rotation of the connections a thread drives, and the
+// trace would then describe one phase of that rotation rather than the run.
+static uint64_t csv_pick_in_window(thread *thread) {
+    return 1 + tinymt64_generate_uint64(&thread->rand) % cfg.csv_sample;
+}
+
+static bool csv_should_record(thread *thread) {
+    if (cfg.csv_sample == 1) return true;
+
+    bool pick = (++thread->samples_seen == thread->samples_pick);
+
+    if (thread->samples_seen == cfg.csv_sample) {
+        thread->samples_seen = 0;
+        thread->samples_pick = csv_pick_in_window(thread);
+    }
+
+    return pick;
+}
+
+static void record_sample(thread *thread, connection *c, uint64_t now,
+                          uint64_t expected_start, int status) {
+    if (thread->samples_len == thread->samples_cap) {
+        thread->samples_cap *= 2;
+        thread->samples = zrealloc(thread->samples,
+                thread->samples_cap * sizeof(sample));
+    }
+
+    sample *s = &thread->samples[thread->samples_len++];
+
+    s->timestamp      = now;
+    s->expected_start = expected_start;
+    s->send_start     = c->actual_latency_start;
+    s->connection     = (uint32_t) (c - thread->cs);
+    s->seq            = (uint32_t) c->complete;
+    s->status         = (uint16_t) status;
+    s->calibrated     = thread->calibrated;
 }
 
 static int header_field(http_parser *parser, const char *at, size_t len) {
@@ -556,6 +659,12 @@ static int response_complete(http_parser *parser) {
 
         uint64_t actual_latency_timing = now - c->actual_latency_start;
         hdr_record_value(thread->u_latency_histogram, actual_latency_timing);
+
+        // Sampling only thins out the trace: every response still reaches
+        // the histograms above, so the reported statistics stay exact.
+        if (cfg.csv && csv_should_record(thread)) {
+            record_sample(thread, c, now, expected_latency_start, status);
+        }
     }
 
 
@@ -704,6 +813,8 @@ static struct option longopts[] = {
     { "help",           no_argument,       NULL, 'h' },
     { "version",        no_argument,       NULL, 'v' },
     { "rate",           required_argument, NULL, 'R' },
+    { "csv",            required_argument, NULL, 'o' },
+    { "csv-sample",     required_argument, NULL, 'n' },
     { NULL,             0,                 NULL,  0  }
 };
 
@@ -716,9 +827,10 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
     cfg->rate        = 0;
+    cfg->csv_sample  = 1;
     cfg->record_all_responses = true;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:LUBrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:o:n:LUBrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -752,6 +864,12 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
             case 'R':
                 if (scan_metric(optarg, &cfg->rate)) return -1;
                 break;
+            case 'o':
+                cfg->csv = optarg;
+                break;
+            case 'n':
+                if (scan_metric(optarg, &cfg->csv_sample)) return -1;
+                break;
             case 'v':
                 printf("wrk %s [%s] ", VERSION, aeGetApiName());
                 printf("Copyright (C) 2012 Will Glozer\n");
@@ -782,10 +900,75 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
         return -1;
     }
 
+    if (cfg->csv_sample == 0) {
+        fprintf(stderr, "CSV sampling interval must be >= 1\n");
+        return -1;
+    }
+
     *url    = argv[optind];
     *header = NULL;
 
     return 0;
+}
+
+static int64_t write_csv(char *path, thread *threads, uint64_t nthreads) {
+    FILE *f = fopen(path, "w");
+
+    if (!f) {
+        fprintf(stderr, "unable to write %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    char *buf = zmalloc(CSV_BUFSIZE);
+    setvbuf(f, buf, _IOFBF, CSV_BUFSIZE);
+
+    fprintf(f, "timestamp_us,elapsed_us,thread,connection,seq,status,"
+               "latency_us,u_latency_us,expected_start_us,send_start_us,"
+               "calibrated\n");
+
+    uint64_t *pos   = zcalloc(nthreads * sizeof(uint64_t));
+    uint64_t  total = 0;
+
+    for (uint64_t i = 0; i < nthreads; i++) total += threads[i].samples_len;
+
+    // Each thread records in completion order, so merging the per-thread
+    // buffers yields a single trace ordered by timestamp.
+    for (uint64_t n = 0; n < total; n++) {
+        uint64_t next = nthreads;
+
+        for (uint64_t i = 0; i < nthreads; i++) {
+            if (pos[i] == threads[i].samples_len) continue;
+            if (next == nthreads ||
+                threads[i].samples[pos[i]].timestamp <
+                threads[next].samples[pos[next]].timestamp) {
+                next = i;
+            }
+        }
+
+        if (next == nthreads) break;
+
+        sample *s = &threads[next].samples[pos[next]++];
+
+        fprintf(f, "%"PRIu64",%"PRId64",%"PRIu64",%"PRIu32",%"PRIu32",%"PRIu16
+                   ",%"PRId64",%"PRId64",%"PRIu64",%"PRIu64",%d\n",
+                s->timestamp,
+                (int64_t) s->timestamp - (int64_t) test_start_us,
+                next,
+                s->connection,
+                s->seq,
+                s->status,
+                (int64_t) s->timestamp - (int64_t) s->expected_start,
+                (int64_t) s->timestamp - (int64_t) s->send_start,
+                s->expected_start,
+                s->send_start,
+                s->calibrated ? 1 : 0);
+    }
+
+    zfree(pos);
+    fclose(f);
+    zfree(buf);
+
+    return (int64_t) total;
 }
 
 static void print_stats_header() {

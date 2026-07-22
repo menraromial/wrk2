@@ -201,6 +201,81 @@
     Transfer/sec:    676.18KB
 
 
+## Per-request CSV trace
+
+  The -o (--csv) flag writes a second, machine readable output alongside the
+  usual summary: one CSV row per response, so that the run can be replayed or
+  plotted as a time series instead of only as an aggregate distribution.
+
+    wrk -t2 -c100 -d30s -R2000 --latency -o trace.csv http://127.0.0.1:80/index.html
+
+    timestamp_us,elapsed_us,thread,connection,seq,status,latency_us,u_latency_us,expected_start_us,send_start_us,calibrated
+    1784742765264862,2515,0,0,1,200,1309,1142,1784742765263553,1784742765263720,0
+    1784742765266136,3789,1,0,1,200,2582,2416,1784742765263554,1784742765263720,0
+
+  Columns:
+
+    timestamp_us        response completion time, usec since the epoch
+    elapsed_us          same instant, relative to the start of the run
+    thread, connection  the thread, and the connection within that thread
+    seq                 response number on that connection, starting at 1
+    status              HTTP status code
+    latency_us          latency as wrk2 reports it, corrected for coordinated
+                        omission: measured from the time the request was due
+                        to be sent under the constant -R rate
+    u_latency_us        uncorrected latency: measured from the time the
+                        request was actually written to the socket
+    expected_start_us   the time the request was due to be sent
+    send_start_us       the time it was actually written out. The gap against
+                        expected_start_us is the queueing delay wrk2 corrects
+                        for
+    calibrated          0 for responses received while the thread was still
+                        calibrating, 1 afterwards
+
+  Rows are merged across threads, so the file is ordered by timestamp_us.
+
+  The trace covers exactly the responses that feed the HdrHistogram output:
+  filtering on calibrated = 1 reproduces the reported percentiles, since the
+  histograms are reset once calibration ends. Requests that never completed
+  (connect, read, write or timeout errors) have no row, and with -B only the
+  last response of each pipelined batch is recorded, matching how the
+  histograms are filled.
+
+  Samples are buffered in memory and written out once the run is over, so the
+  measurement itself is not perturbed by disk I/O. Budget about 40 bytes of
+  memory per expected response (wrk2 prints the amount it reserves when the
+  run starts) and roughly 100 bytes per row on disk.
+
+### Sampling the trace
+
+  At high rates a full trace gets unwieldy: 100k req/s over a minute is 6M
+  rows, around 240MB of memory and 600MB on disk. The -n (--csv-sample) flag
+  keeps only one response in N:
+
+    wrk -t4 -c200 -d60s -R100k --latency -o trace.csv -n 100 http://127.0.0.1:80/
+
+  Sampling only thins out the CSV. Every response still goes into the
+  histograms, so the percentiles, the mean and the request counts printed on
+  stdout stay exact whatever N is.
+
+  One response is kept per window of N, at a position drawn afresh for each
+  window rather than at a fixed one. A fixed position locks onto the rotation
+  of the connections a thread drives, and the trace then describes one phase
+  of that rotation instead of the run: measured on a 500 req/s run, fixed
+  1-in-10 sampling reported a mean latency of 1.96ms against 1.46ms for the
+  full population, while the randomised window lands within 1% of it.
+
+  What sampling does cost is the tail. The extremes are rare by construction,
+  so a 1-in-N trace will usually miss them: on the same run, the sampled trace
+  put the maximum at 3.42ms against 3.51ms, and p99 at 2.78ms against 2.95ms.
+  Read the tail off the HdrHistogram output, which remains exhaustive, and use
+  the CSV for the time series, the per-connection behaviour and the shape of
+  the bulk of the distribution.
+
+  The seq column still carries the true response number on the connection, so
+  a sampled trace shows which responses were skipped.
+
+
 ## Scripting
 
   wrk's public Lua API is:

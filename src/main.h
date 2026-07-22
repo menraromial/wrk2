@@ -47,6 +47,12 @@ static int response_body(http_parser *, const char *, size_t);
 
 static uint64_t time_us();
 
+static uint64_t csv_samples_per_thread(double);
+static uint64_t csv_pick_in_window(thread *);
+static bool csv_should_record(thread *);
+static void record_sample(thread *, connection *, uint64_t, uint64_t, int);
+static int64_t write_csv(char *, thread *, uint64_t);
+
 static int parse_args(struct config *, char **, struct http_parser_url *, char **, int, char **);
 static char *copy_url_part(char *, struct http_parser_url *, enum http_parser_url_fields);
 static void print_stats_header();
