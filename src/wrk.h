@@ -41,6 +41,7 @@ typedef struct {
 
 typedef struct {
     pthread_t thread;
+    uint64_t index;
     aeEventLoop *loop;
     struct addrinfo *addr;
     uint64_t connections;
@@ -87,6 +88,7 @@ typedef struct connection {
     uint64_t catch_up_start_time;
     uint64_t complete_at_catch_up_start;
     uint64_t thread_start;
+    uint64_t phase_us;
     uint64_t start;
     char *request;
     size_t length;

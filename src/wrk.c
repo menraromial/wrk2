@@ -145,6 +145,7 @@ int main(int argc, char **argv) {
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
+        t->index       = i;
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = connections;
         t->throughput = throughput;
@@ -331,7 +332,15 @@ void *thread_main(void *arg) {
         c->catch_up_throughput = throughput * 2;
         c->complete   = 0;
         c->caught_up  = true;
-        // Stagger connects 5 msec apart within thread:
+        // Spread the first send of each connection over one send interval.
+        // Connects are staggered 5 msec apart, so without this the connections
+        // of a thread all send their first request within 5 ms x connections,
+        // then stay silent for the rest of the interval: below 200 req/s per
+        // thread the load reaches the server in bursts rather than at the rate
+        // asked for, whatever the connection count.
+        c->phase_us   = throughput > 0.0
+            ? (uint64_t)((thread->index * thread->connections + i)
+                         / (throughput * cfg.connections)) : 0;
         aeCreateTimeEvent(loop, i * 5, delayed_initial_connect, c, NULL);
     }
 
@@ -391,7 +400,9 @@ static int reconnect_socket(thread *thread, connection *c) {
 
 static int delayed_initial_connect(aeEventLoop *loop, long long id, void *data) {
     connection* c = data;
-    c->thread_start = time_us();
+    // The connection opens now; its first send waits out its share of the
+    // interval, so the thread's connections do not fire together.
+    c->thread_start = time_us() + c->phase_us;
     connect_socket(c->thread, c);
     return AE_NOMORE;
 }
